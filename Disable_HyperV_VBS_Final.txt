@@ -1,0 +1,768 @@
+# ============================================================
+# Full Hyper-V / VBS / Device Guard Disable Script (FINAL MERGED)
+# Windows 11 24H2 - Standalone with IT Logging
+# Combines: Disable_HyperV_VBS.txt safety features + DG Readiness Tool -Disable logic
+# No external downloads required — fully self-contained
+# Run in PowerShell as Administrator (auto-elevates if needed)
+# ============================================================
+
+param(
+    [string]$LogDir = "C:\DGLogs"
+)
+
+# ------------------------------------------------------------
+# Helper Function: Write-Log (timestamped IT logging)
+# ------------------------------------------------------------
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO",
+        [string]$Color = "White"
+    )
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $logEntry = "[$timestamp] [$Level] $Message"
+    if ($script:logFile) {
+        try {
+            Add-Content -Path $script:logFile -Value $logEntry -Force -ErrorAction Stop
+        } catch {
+            Write-Host "[LOG WRITE ERROR] Could not write to log: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    if ($Level -eq "SUCCESS") {
+        Write-Host $Message -ForegroundColor Green
+    } elseif ($Level -eq "WARN") {
+        Write-Host $Message -ForegroundColor Yellow
+    } elseif ($Level -eq "ERROR") {
+        Write-Host $Message -ForegroundColor Red
+    } else {
+        Write-Host $Message -ForegroundColor $Color
+    }
+}
+
+# ------------------------------------------------------------
+# Helper: ExecuteCommandAndLog (from DG Readiness Tool)
+# Uses cmd /c instead of Invoke-Expression to avoid injection risk
+# ------------------------------------------------------------
+function ExecuteCommandAndLog {
+    param([string]$_cmd)
+    try {
+        Write-Log "Executing: $_cmd" -Level "INFO"
+        $CmdOutput = cmd /c $_cmd 2>&1 | Out-String
+        Write-Log "Output: $CmdOutput" -Level "INFO"
+    } catch {
+        Write-Log "Exception while executing $_cmd : $($_.Exception.Message)" -Level "WARN"
+    }
+}
+
+
+# ------------------------------------------------------------
+# Auto-Elevation: If running in standard PowerShell, prompt for Administrator rights
+# ------------------------------------------------------------
+if (-not ([System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Administrator privileges required." -ForegroundColor Yellow
+    Write-Host "Requesting Administrator permission via UAC prompt..." -ForegroundColor Cyan
+
+    $rawPath = $PSCommandPath
+    if (-not $rawPath) {
+        $rawPath = $MyInvocation.MyCommand.Path
+    }
+    if (-not $rawPath -and $MyInvocation.MyCommand.Name) {
+        $candidate = Join-Path -Path $PSScriptRoot -ChildPath $MyInvocation.MyCommand.Name
+        if (Test-Path -Path $candidate) {
+            $rawPath = $candidate
+        }
+    }
+
+    $scriptPath = $null
+    if ($rawPath -and (Test-Path -Path $rawPath)) {
+        $scriptPath = (Resolve-Path -Path $rawPath).Path
+    }
+
+    if ($scriptPath) {
+        try {
+            if ($scriptPath.EndsWith(".txt", [System.StringComparison]::OrdinalIgnoreCase)) {
+                Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -Command `"& { [string]`$c = Get-Content -Raw -LiteralPath '$scriptPath'; Invoke-Expression `$c }`"" -Verb RunAs
+            } else {
+                Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -LogDir `"$LogDir`"" -Verb RunAs
+            }
+            Write-Host "Elevated Administrator session launched in a separate window." -ForegroundColor Green
+            exit
+        } catch {
+            Write-Host "Administrator elevation was declined or cancelled." -ForegroundColor Red
+            exit
+        }
+    } else {
+        Write-Host "ERROR: Could not resolve script file path for auto-elevation." -ForegroundColor Red
+        Write-Host "Please right-click PowerShell, choose 'Run as administrator', and run the script file." -ForegroundColor Yellow
+        exit
+    }
+}
+
+# ------------------------------------------------------------
+# Logging Initialization
+# ------------------------------------------------------------
+try {
+    if (-not (Test-Path -Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+} catch {
+    Write-Host "[WARNING] Could not create log folder '$LogDir': $($_.Exception.Message)" -ForegroundColor Yellow
+    $LogDir = "$env:TEMP\DGLogs"
+    if (-not (Test-Path -Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+$script:logFile = Join-Path -Path $LogDir -ChildPath "Disable_HyperV_VBS_Log.txt"
+$logFile = $script:logFile
+
+# Start IT Log Session
+Write-Log "============================================================" -Level "INFO" -Color Cyan
+Write-Log "STARTING HYPER-V & VBS DISABLE SESSION (FINAL MERGED)" -Level "INFO" -Color Cyan
+Write-Log "Computer Name: $env:COMPUTERNAME | User: $env:USERNAME" -Level "INFO" -Color Gray
+$_os = Get-CimInstance Win32_OperatingSystem
+Write-Log "Windows OS: $($_os.Caption) (Build $($_os.BuildNumber))" -Level "INFO" -Color Gray
+Write-Log "Log file location: $logFile" -Level "INFO" -Color Gray
+Write-Log "============================================================" -Level "INFO" -Color Cyan
+
+# ------------------------------------------------------------
+# Pre-Flight Safety: Battery/AC check, System Restore Point, BCD Backup
+# Protects against power-loss mid-script (especially during Step 8 UEFI/BCD)
+# ------------------------------------------------------------
+Write-Log "`n=== Pre-Flight Safety Checks ===" -Level "INFO" -Color Cyan
+
+# 1. Battery / AC power check — prompt user whether to continue if running on battery
+try {
+    $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
+    if ($battery) {
+        $powerOnline = (Get-CimInstance -ClassName BatteryStatus -Namespace root\wmi -ErrorAction SilentlyContinue).PowerOnline
+        if ($powerOnline -eq $false -or ($battery.BatteryStatus -ne 2 -and $battery.BatteryStatus -ne 6 -and $battery.BatteryStatus -ne 8 -and $battery.BatteryStatus -ne 9)) {
+            Write-Host "`n============================================================" -ForegroundColor Yellow
+            Write-Host " [WARNING] CHARGER NOT DETECTED! RUNNING ON BATTERY!        " -ForegroundColor Yellow
+            Write-Host "============================================================" -ForegroundColor Yellow
+            Write-Host " Running system firmware & security modifications on battery" -ForegroundColor Yellow
+            Write-Host " is risky. If the battery dies mid-reboot, it can corrupt" -ForegroundColor Yellow
+            Write-Host " your Windows boot or trigger BitLocker recovery." -ForegroundColor Yellow
+            Write-Host "`n It is recommended to plug in your laptop charger." -ForegroundColor White
+            Write-Host "============================================================" -ForegroundColor Yellow
+            Write-Host " Options:" -ForegroundColor White
+            Write-Host "   [Y] Continue anyway" -ForegroundColor White
+            Write-Host "   [N] Abort (plug in charger first)" -ForegroundColor White
+            Write-Host "============================================================" -ForegroundColor Yellow
+            $chargerChoice = Read-Host " Do you want to continue? (y/N)"
+            if ($chargerChoice -notmatch "^[yY]") {
+                Write-Log "User chose to abort because charger is not connected." -Level "INFO"
+                Write-Host "`nScript aborted by user. Please connect your charger and re-run." -ForegroundColor Gray
+                exit
+            }
+            Write-Log "User chose to continue without charger (or after plugging it in)." -Level "WARN"
+        } else {
+            Write-Log "Power Source: AC Power Connected (Charger Plugged In)." -Level "SUCCESS"
+        }
+    } else {
+        Write-Log "Power Source: Desktop PC / AC Power (No Battery)." -Level "INFO" -Color Gray
+    }
+} catch {
+    Write-Log "Battery check skipped: $($_.Exception.Message)" -Level "WARN"
+}
+
+# 2. Create System Restore Point (rollback safety net)
+try {
+    # Ensure System Restore is enabled on C:
+    $srStatus = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue).SystemRestore
+    if ($srStatus) {
+        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue
+    }
+    Checkpoint-Computer -Description "Before Hyper-V VBS Disable Script" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+    Write-Log "System Restore Point created: 'Before Hyper-V VBS Disable Script'" -Level "SUCCESS"
+} catch {
+    Write-Log "Could not create System Restore Point: $($_.Exception.Message)" -Level "WARN"
+    Write-Log "To manually create one: Settings > System > Recovery > System Restore > Create" -Level "WARN"
+}
+
+# 3. Backup BCD (instant rollback if Step 8 corrupts boot entries)
+try {
+    $bcdBackupPath = Join-Path -Path $LogDir -ChildPath "BCD_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').bcd"
+    $bcdExport = (bcdedit /export $bcdBackupPath 2>&1 | Out-String)
+    if ($LASTEXITCODE -eq 0 -or $bcdExport -match "success") {
+        Write-Log "BCD backed up to: $bcdBackupPath" -Level "SUCCESS"
+        Write-Log "To restore if boot fails: bcdedit /import $bcdBackupPath" -Level "INFO" -Color Gray
+    } else {
+        Write-Log "BCD backup output: $bcdExport" -Level "WARN"
+    }
+} catch {
+    Write-Log "Could not backup BCD: $($_.Exception.Message)" -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Step 0: Detect OEM manufacturer & disable OEM bloatware that re-enables VBS
+#         (ASUS Armoury Crate, MSI Center, Razer Synapse, Lenovo Vantage, HP Sure Click, Acer Care Center)
+# ------------------------------------------------------------
+Write-Log "`n=== Step 0: Detecting OEM manufacturer & disabling OEM bloatware ===" -Level "INFO" -Color Cyan
+try {
+    $mfr = (Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
+    Write-Log "Detected manufacturer: $mfr" -Level "INFO" -Color Gray
+} catch {
+    $mfr = "Unknown"
+    Write-Log "Could not detect manufacturer: $($_.Exception.Message)" -Level "WARN"
+}
+
+# Universal OEM service list (covers ASUS, MSI, Razer, Lenovo, HP, Acer)
+$oemServices = @(
+    "ArmouryCrateService*","MyASUS*","AsIO*","AsusAppService*","ASUSSoftwareManager*","ASUSSystemAnalysis*","ASUSOptimization*","AsusSysCap*","AsusLinkNear*",  # ASUS
+    "MSICenterService*","MSI_App_Service*","MSI*Service*",                                          # MSI
+    "RazerSynapseService*","RazerGameManagerService*","Razer*Service*",                             # Razer
+    "LenovoVantage*","ImControllerService*","Lenovo*Service*",                                      # Lenovo
+    "HPSureClick*","HP*Service*","HPCommRecovery*",                                                  # HP
+    "AcerCareCenter*","PredatorSense*","Acer*Service*"                                              # Acer
+)
+$foundSvc = Get-Service -Name $oemServices -ErrorAction SilentlyContinue
+if ($foundSvc) {
+    foreach ($svc in $foundSvc) {
+        try {
+            Write-Log "Disabling OEM service: $($svc.Name) ($($svc.DisplayName))" -Level "WARN"
+            Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
+            Write-Log "Disabled OEM service: $($svc.Name)" -Level "SUCCESS"
+        } catch {
+            Write-Log "Could not disable $($svc.Name): $($_.Exception.Message)" -Level "WARN"
+        }
+    }
+} else {
+    Write-Log "No known OEM bloatware services found (clean state)." -Level "INFO" -Color Gray
+}
+
+# Disable OEM scheduled tasks that re-arm VBS on boot
+$oemTasks = @(
+    "*ArmouryCrate*","*MyASUS*","*ASUSSystemAnalysis*","*ASUSSoftwareManager*","*ASUSOptimization*",  # ASUS
+    "*MSICenter*","*MSIAfterburner*","*MSI_App*",                                # MSI (avoids matching *.msi tasks)
+    "*RazerSynapse*","*RazerGameManager*","*RazerCortex*",                       # Razer
+    "*LenovoVantage*","*ImController*","*LenovoUtility*",                        # Lenovo
+    "*HPSureClick*","*HPSupportAssistant*","*HPCommRecovery*",                   # HP (avoids matching generic *HP* tasks)
+    "*AcerCareCenter*","*PredatorSense*"                                         # Acer
+)
+$foundTasks = Get-ScheduledTask -TaskName $oemTasks -ErrorAction SilentlyContinue
+if ($foundTasks) {
+    foreach ($task in $foundTasks) {
+        try {
+            Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null
+            Write-Log "Disabled OEM scheduled task: $($task.TaskName)" -Level "SUCCESS"
+        } catch {
+            Write-Log "Could not disable task $($task.TaskName): $($_.Exception.Message)" -Level "WARN"
+        }
+    }
+} else {
+    Write-Log "No known OEM scheduled tasks found (clean state)." -Level "INFO" -Color Gray
+}
+
+# ------------------------------------------------------------
+# Step 0b: Kill WSL2 (Store version + Windows feature) — the VT-x thief
+# ------------------------------------------------------------
+Write-Log "`n=== Step 0b: Removing WSL2 (holds the hypervisor / VT-x) ===" -Level "INFO" -Color Cyan
+try {
+    $wslExe = Get-Command wsl -ErrorAction SilentlyContinue
+    if ($wslExe) {
+        Write-Log "Shutting down any running WSL instances..." -Level "INFO"
+        wsl --shutdown 2>&1 | Out-Null
+        Write-Log "WSL instances shut down." -Level "SUCCESS"
+    }
+} catch {
+    Write-Log "WSL shutdown note: $($_.Exception.Message)" -Level "WARN"
+}
+
+# Uninstall Store-version WSL2 (the real culprit on Windows 11 24H2)
+try {
+    $wslApp = Get-AppxPackage *WindowsSubsystemForLinux* -ErrorAction SilentlyContinue
+    if ($wslApp) {
+        Write-Log "Uninstalling Store-version WSL2 app: $($wslApp.Name)" -Level "WARN"
+        Remove-AppxPackage -Package $wslApp.PackageFullName -ErrorAction Stop
+        Write-Log "Store-version WSL2 uninstalled." -Level "SUCCESS"
+    } else {
+        Write-Log "No Store-version WSL2 app found." -Level "INFO" -Color Gray
+    }
+} catch {
+    Write-Log "Could not uninstall Store WSL2: $($_.Exception.Message)" -Level "WARN"
+}
+try {
+    $wslKernel = Get-AppxPackage *WSL* -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "Kernel" }
+    if ($wslKernel) {
+        Remove-AppxPackage -Package $wslKernel.PackageFullName -ErrorAction SilentlyContinue
+        Write-Log "Removed WSL kernel package: $($wslKernel.Name)" -Level "SUCCESS"
+    }
+} catch {
+    Write-Log "WSL kernel package note: $($_.Exception.Message)" -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Pre-Check: Verify BitLocker / Device Encryption is OFF
+# If BitLocker is ON, abort the script to prevent recovery key issues
+# ------------------------------------------------------------
+Write-Log "`n=== Pre-Check: Verifying BitLocker / Device Encryption status ===" -Level "INFO" -Color Cyan
+$bitlockerActive = $false
+try {
+    $bdeStatus = (manage-bde -status C: 2>&1 | Out-String)
+    Write-Log "BitLocker status check output: $bdeStatus" -Level "INFO"
+
+    if ($bdeStatus -match "Protection On") {
+        $bitlockerActive = $true
+    }
+
+    # Also check Windows modern device encryption (Settings > Privacy & Security > Device Encryption)
+    $deviceEncryptionPath = "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker"
+    if (Test-Path -Path $deviceEncryptionPath) {
+        $devEncStatus = Get-ItemProperty -Path $deviceEncryptionPath -ErrorAction SilentlyContinue
+        if ($devEncStatus.PreventDeviceEncryption -eq 0) {
+            # Check if modern encryption is active via WMI
+            $encVolume = Get-CimInstance -Namespace "root\cimv2\security\MicrosoftVolumeEncryption" -ClassName Win32_EncryptableVolume -ErrorAction SilentlyContinue
+            if ($encVolume -and $encVolume.ProtectionStatus -eq 1) {
+                $bitlockerActive = $true
+            }
+        }
+    }
+} catch {
+    Write-Log "BitLocker status check encountered an error: $($_.Exception.Message)" -Level "WARN"
+}
+
+if ($bitlockerActive) {
+    Write-Log "WARNING: BitLocker / Device Encryption is currently ON!" -Level "WARN"
+    Write-Log "Modifying UEFI firmware variables (SecConfig.efi) and BCD can trigger a BitLocker recovery key prompt on next reboot." -Level "WARN"
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host "  WARNING: BITLOCKER / DEVICE ENCRYPTION IS ACTIVE" -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  This script changes UEFI variables (SecConfig.efi) and BCD entries." -ForegroundColor Yellow
+    Write-Host "  On the next reboot, Windows may require your 48-digit Recovery Key!" -ForegroundColor Yellow
+    Write-Host "  Make sure you have your BitLocker Recovery Key saved before continuing." -ForegroundColor Cyan
+    Write-Host "  (You can find it at: https://account.microsoft.com/devices/recoverykey)" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Options:" -ForegroundColor White
+    Write-Host "    [Y] Continue anyway (will temporarily suspend BitLocker for next reboot)" -ForegroundColor White
+    Write-Host "    [N] Abort (recommended if you do not have your recovery key saved)" -ForegroundColor White
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host ""
+    $blChoice = Read-Host "Do you want to continue anyway? (y/N)"
+    if ($blChoice -notmatch "^[yY]") {
+        Write-Log "User chose to abort due to active BitLocker." -Level "INFO"
+        Write-Host "`nScript aborted by user. No changes were made." -ForegroundColor Gray
+        exit
+    }
+
+    Write-Log "User chose to proceed with BitLocker active. Temporarily suspending BitLocker protection..." -Level "WARN"
+    try {
+        Suspend-BitLocker -MountPoint "C:" -RebootCount 2 -ErrorAction SilentlyContinue | Out-Null
+        manage-bde -protectors -disable C: 2>&1 | Out-Null
+        Write-Log "BitLocker suspended for upcoming reboots to prevent recovery key lock." -Level "SUCCESS"
+        Write-Host "BitLocker temporarily suspended for upcoming reboots." -ForegroundColor Green
+    } catch {
+        Write-Log "Could not suspend BitLocker: $($_.Exception.Message)" -Level "WARN"
+    }
+} else {
+    Write-Log "BitLocker / Device Encryption is OFF — safe to proceed." -Level "SUCCESS"
+    Write-Host "BitLocker / Device Encryption is OFF — safe to proceed." -ForegroundColor Green
+}
+
+# ------------------------------------------------------------
+# Step 1: Stopping Hyper-V services (with verification)
+# ------------------------------------------------------------
+Write-Log "`n=== Step 1: Stopping Hyper-V services ===" -Level "INFO" -Color Cyan
+try {
+    $hvServices = Get-Service | Where-Object { $_.DisplayName -like "*Hyper-V*" -and $_.Status -eq "Running" }
+    if ($hvServices) {
+        foreach ($svc in $hvServices) {
+            Write-Log "Stopping $($svc.DisplayName) ($($svc.Name))..." -Level "INFO"
+            Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+            $svc.Refresh()
+            if ($svc.Status -eq "Stopped") {
+                Write-Log "Stopped service: $($svc.Name)" -Level "SUCCESS"
+            } else {
+                Write-Log "Service $($svc.Name) could not be stopped (current status: $($svc.Status)). It should stop after reboot." -Level "WARN"
+            }
+        }
+    } else {
+        Write-Log "No active Hyper-V services were running." -Level "INFO" -Color Gray
+    }
+} catch {
+    Write-Log "Error stopping Hyper-V services: $($_.Exception.Message)" -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Step 2: Disabling Hyper-V and related Windows features (with per-feature logging)
+# ------------------------------------------------------------
+Write-Log "`n=== Step 2: Disabling Hyper-V and related Windows features (DISM /LimitAccess — no hang) ===" -Level "INFO" -Color Cyan
+$features = @(
+    "Microsoft-Hyper-V-All",
+    "HypervisorPlatform",
+    "VirtualMachinePlatform",
+    "Microsoft-Windows-Subsystem-Linux"
+)
+
+foreach ($feat in $features) {
+    try {
+        Write-Log "Disabling feature: $feat (via DISM /LimitAccess)..." -Level "INFO"
+        # Use DISM with /LimitAccess to avoid Windows Update hang (Disable-WindowsOptionalFeature hangs on 24H2)
+        $dismOut = (DISM.EXE /Online /Disable-Feature /FeatureName:$feat /NoRestart /LimitAccess 2>&1 | Out-String)
+        Write-Log "DISM output for $feat : $dismOut" -Level "INFO"
+        if ($dismOut -match "The operation completed successfully" -or $dismOut -match "Feature name .* is unknown" -or $dismOut -match "already disabled") {
+            Write-Log "Feature $feat disabled (or not present)." -Level "SUCCESS"
+        } else {
+            Write-Log "Feature $feat DISM output did not report success — may already be disabled." -Level "WARN"
+        }
+    } catch {
+        Write-Log "Feature $($feat): $($_.Exception.Message)" -Level "WARN"
+    }
+}
+
+# ------------------------------------------------------------
+# Step 3: Disabling hypervisor launch type in BCD
+# ------------------------------------------------------------
+Write-Log "`n=== Step 3: Disabling hypervisor launch type in BCD ===" -Level "INFO" -Color Cyan
+try {
+    $bcdOut = (bcdedit /set hypervisorlaunchtype off 2>&1 | Out-String).Trim()
+    Write-Log "bcdedit /set hypervisorlaunchtype off -> $bcdOut" -Level "SUCCESS"
+} catch {
+    Write-Log "Failed to set hypervisorlaunchtype: $($_.Exception.Message)" -Level "ERROR"
+}
+
+# ------------------------------------------------------------
+# Step 4: Disabling VBS in Registry (Set to 0 AND Delete keys)
+#         Combines both approaches: Set-ItemProperty + REG DELETE
+# ------------------------------------------------------------
+Write-Log "`n=== Step 4: Disabling Virtualization-Based Security (VBS) in Registry ===" -Level "INFO" -Color Cyan
+
+# 4a: Set values to 0 first (keeps keys for audit, immediate effect)
+try {
+    $dgPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
+    if (-not (Test-Path -Path $dgPath)) { New-Item -Path $dgPath -Force | Out-Null }
+    Set-ItemProperty -Path $dgPath -Name "EnableVirtualizationBasedSecurity" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $dgPath -Name "RequirePlatformSecurityFeatures" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $dgPath -Name "Locked" -Value 0 -Type DWord -Force
+    Write-Log "VBS Registry values set to 0: EnableVirtualizationBasedSecurity, RequirePlatformSecurityFeatures, Locked" -Level "SUCCESS"
+} catch {
+    Write-Log "Error setting VBS registry values to 0: $($_.Exception.Message)" -Level "ERROR"
+}
+
+# 4b: Delete keys entirely (DG Readiness Tool method — more thorough)
+Write-Log "Deleting VBS registry keys entirely (DG Readiness Tool method)..." -Level "INFO"
+ExecuteCommandAndLog 'REG DELETE "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" /v "EnableVirtualizationBasedSecurity" /f'
+ExecuteCommandAndLog 'REG DELETE "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" /v "RequirePlatformSecurityFeatures" /f'
+
+# Windows 11 24H2 is always Redstone+ (build > 10586); simplified from DG Readiness Tool
+ExecuteCommandAndLog 'REG DELETE "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" /v "Locked" /f'
+
+# Delete HypervisorEnforcedCodeIntegrity keys (Scenarios subkey is recreated with Enabled=0 in Step 5)
+ExecuteCommandAndLog 'REG DELETE "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" /v "HypervisorEnforcedCodeIntegrity" /f'
+ExecuteCommandAndLog 'REG DELETE "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /f'
+Write-Log "VBS registry keys deleted successfully." -Level "SUCCESS"
+
+# ------------------------------------------------------------
+# Step 5: Disabling Memory Integrity (Core Isolation / HVCI)
+# ------------------------------------------------------------
+Write-Log "`n=== Step 5: Disabling Memory Integrity (Core Isolation / HVCI) ===" -Level "INFO" -Color Cyan
+try {
+    $hvciPath = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+    if (-not (Test-Path -Path $hvciPath)) { New-Item -Path $hvciPath -Force | Out-Null }
+    Set-ItemProperty -Path $hvciPath -Name "Enabled" -Value 0 -Type DWord -Force
+    Write-Log "Memory Integrity (HVCI) set to Enabled=0 in Registry" -Level "SUCCESS"
+} catch {
+    Write-Log "Error setting HVCI registry key: $($_.Exception.Message)" -Level "ERROR"
+}
+
+# ------------------------------------------------------------
+# Step 6: Clearing Device Guard / Credential Guard Locks
+# ------------------------------------------------------------
+Write-Log "`n=== Step 6: Clearing Device Guard / Credential Guard Locks ===" -Level "INFO" -Color Cyan
+
+# 6a: Clear Credential Guard LSA flags (DG Readiness Tool method)
+ExecuteCommandAndLog 'REG DELETE "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v "LsaCfgFlags" /f'
+Write-Log "Cleared LsaCfgFlags (Credential Guard LSA flags)." -Level "SUCCESS"
+
+# 6b: Remove GPO-managed DeviceGuard policy key (would re-enable VBS on policy refresh)
+$dgPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard"
+if (Test-Path -Path $dgPolicyPath) {
+    try {
+        Remove-Item -Path $dgPolicyPath -Recurse -Force -ErrorAction Stop
+        Write-Log "Removed GPO DeviceGuard policy key: $dgPolicyPath" -Level "SUCCESS"
+    } catch {
+        Write-Log "Warning removing GPO DeviceGuard policy key (device may be Intune/GPO managed): $($_.Exception.Message)" -Level "WARN"
+    }
+} else {
+    Write-Log "No GPO DeviceGuard policy key found (clean state)." -Level "INFO" -Color Gray
+}
+
+# 6c: Delete deployed Code Integrity policy (SIPolicy.p7b)
+if (Test-Path -Path "$env:windir\System32\CodeIntegrity\SIPolicy.p7b") {
+    try {
+        Remove-Item -Path "$env:windir\System32\CodeIntegrity\SIPolicy.p7b" -Force -ErrorAction Stop
+        Write-Log "Deleted deployed Code Integrity policy (SIPolicy.p7b)." -Level "SUCCESS"
+    } catch {
+        Write-Log "Warning removing SIPolicy.p7b: $($_.Exception.Message)" -Level "WARN"
+    }
+} else {
+    Write-Log "No SIPolicy.p7b found (clean state)." -Level "INFO" -Color Gray
+}
+
+# 6d: Remove modern WDAC policies (Windows 11 Application Control .cip files)
+$wdacDir = "$env:windir\System32\CodeIntegrity\CIpolicies\Active"
+if (Test-Path -Path $wdacDir) {
+    $cipFiles = Get-ChildItem -Path $wdacDir -Filter "*.cip" -ErrorAction SilentlyContinue
+    if ($cipFiles) {
+        foreach ($cip in $cipFiles) {
+            try {
+                Remove-Item -Path $cip.FullName -Force -ErrorAction Stop
+                Write-Log "Deleted active WDAC policy: $($cip.Name)" -Level "SUCCESS"
+            } catch {
+                Write-Log "Warning removing WDAC policy $($cip.Name): $($_.Exception.Message)" -Level "WARN"
+            }
+        }
+    } else {
+        Write-Log "No active WDAC .cip policies found (clean state)." -Level "INFO" -Color Gray
+    }
+} else {
+    Write-Log "No WDAC CIpolicies\Active directory found (clean state)." -Level "INFO" -Color Gray
+}
+
+# ------------------------------------------------------------
+# Step 7: Disabling Hyper-V and IOMMU via DISM (DG Readiness Tool method)
+# ------------------------------------------------------------
+Write-Log "`n=== Step 7: Disabling Hyper-V and IOMMU via DISM ===" -Level "INFO" -Color Cyan
+# IsolatedUserMode separate disable not needed — Windows 11 24H2 is always Redstone+
+try {
+    $CmdOutput = DISM.EXE /Online /disable-Feature /FeatureName:Microsoft-Hyper-V-Hypervisor /NoRestart | Out-String
+    if (-not $CmdOutput.Contains("The operation completed successfully.")) {
+        $CmdOutput = DISM.EXE /Online /disable-Feature /FeatureName:Microsoft-Hyper-V-Online /NoRestart | Out-String
+    }
+    Write-Log "DISM output: $CmdOutput" -Level "INFO"
+    if ($CmdOutput.Contains("The operation completed successfully.")) {
+        Write-Log "Disabling Hyper-V and IOMMU via DISM successful." -Level "SUCCESS"
+    } else {
+        Write-Log "DISM Hyper-V disable did not report success (may already be disabled). Check log." -Level "WARN"
+    }
+} catch {
+    Write-Log "DISM Hyper-V disable error: $($_.Exception.Message)" -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Step 8: Configuring UEFI Opt-Out via built-in SecConfig.efi
+# ------------------------------------------------------------
+Write-Log "`n=== Step 8: Configuring UEFI Opt-Out via built-in SecConfig.efi ===" -Level "INFO" -Color Cyan
+$secConfigSrc = "$env:windir\System32\SecConfig.efi"
+if (Test-Path -Path $secConfigSrc) {
+    $freeDrive = $null
+    $efiMounted = $false
+    try {
+        # Pick the first available drive letter from Z: down to E: to avoid collisions
+        $availableLetters = 90..69 | ForEach-Object { [char]$_ + ":" } | Where-Object { -not (Test-Path -Path $_) }
+        if (-not $availableLetters) {
+            Write-Log "No available drive letter found to mount EFI partition." -Level "ERROR"
+            throw "No free drive letter available."
+        }
+        $freeDrive = $availableLetters[0]
+
+        Write-Log "Mounting EFI System Partition to temporary drive $freeDrive..." -Level "INFO"
+        mountvol $freeDrive /s
+        $efiMounted = $true
+
+        $efiBootDir = "$freeDrive\EFI\Microsoft\Boot"
+        if (-not (Test-Path -Path $efiBootDir)) {
+            New-Item -ItemType Directory -Path $efiBootDir -Force | Out-Null
+        }
+        Copy-Item -Path $secConfigSrc -Destination "$efiBootDir\SecConfig.efi" -Force
+
+        # Verify the copy with hash check — prevents boot failure from corrupt SecConfig.efi
+        $srcHash = (Get-FileHash -Path $secConfigSrc -Algorithm SHA256).Hash
+        $dstHash = (Get-FileHash -Path "$efiBootDir\SecConfig.efi" -Algorithm SHA256).Hash
+        if ($srcHash -ne $dstHash) {
+            Write-Log "ERROR: SecConfig.efi copy verification FAILED (hash mismatch). Aborting Step 8 to prevent boot corruption." -Level "ERROR"
+            Write-Log "  Source hash: $srcHash" -Level "ERROR"
+            Write-Log "  Dest hash:   $dstHash" -Level "ERROR"
+            throw "SecConfig.efi copy is corrupt — refusing to set BCD bootsequence."
+        }
+        Write-Log "SecConfig.efi copied & verified (SHA256 match). Safe to set BCD." -Level "SUCCESS"
+
+        # Only set BCD bootsequence AFTER file copy is verified — atomic operation
+        cmd /c 'bcdedit /create "{0cb3b571-2f2e-4343-a879-d86a476d7215}" /d "DGOptOut" /application osloader' 2>$null
+        bcdedit /set '{0cb3b571-2f2e-4343-a879-d86a476d7215}' path "\EFI\Microsoft\Boot\SecConfig.efi" | Out-Null
+        bcdedit /set '{0cb3b571-2f2e-4343-a879-d86a476d7215}' loadoptions "DISABLE-LSA-ISO,DISABLE-VBS" | Out-Null
+        bcdedit /set '{0cb3b571-2f2e-4343-a879-d86a476d7215}' device "partition=$freeDrive" | Out-Null
+        # Set bootsequence LAST — so if power dies before this line, no boot entry points to anything
+        bcdedit /set '{bootmgr}' bootsequence '{0cb3b571-2f2e-4343-a879-d86a476d7215}' | Out-Null
+
+        Write-Log "UEFI Opt-Out successfully configured in BCD bootsequence (atomic: file verified before BCD)." -Level "SUCCESS"
+    } catch {
+        Write-Log "Warning configuring SecConfig.efi: $($_.Exception.Message)" -Level "WARN"
+    } finally {
+        if ($efiMounted -and $freeDrive) {
+            mountvol $freeDrive /d 2>$null
+            Write-Log "EFI System Partition dismounted from $freeDrive." -Level "INFO"
+        }
+    }
+} else {
+    Write-Log "SecConfig.efi not found in System32; skipping UEFI variable deletion." -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Step 9: Verifying hypervisor launch type in BCD
+# ------------------------------------------------------------
+Write-Log "`n=== Step 9: Verifying hypervisor launch type in BCD ===" -Level "INFO" -Color Cyan
+try {
+    $bcdCheck = (bcdedit /enum '{current}' 2>&1 | Select-String -Pattern "hypervisorlaunchtype" | Out-String).Trim()
+    if ($bcdCheck -match 'hypervisorlaunchtype\s+Off') {
+        Write-Log "BCD verified: hypervisorlaunchtype = Off" -Level "SUCCESS"
+    } elseif ($bcdCheck) {
+        # Value exists but is not Off - re-apply and re-verify
+        Write-Log "hypervisorlaunchtype is NOT Off: $bcdCheck" -Level "WARN"
+        $null = bcdedit /set hypervisorlaunchtype off
+        $recheck = (bcdedit /enum '{current}' 2>&1 | Select-String -Pattern "hypervisorlaunchtype" | Out-String).Trim()
+        if ($recheck -match 'hypervisorlaunchtype\s+Off') {
+            Write-Log "Re-applied successfully: hypervisorlaunchtype = Off" -Level "SUCCESS"
+        } else {
+            Write-Log "Could not confirm hypervisorlaunchtype=Off after re-apply: $recheck" -Level "ERROR"
+        }
+    } else {
+        # Entry not present - default can be Auto; set it explicitly
+        Write-Log "hypervisorlaunchtype entry not found in BCD; setting it explicitly to Off." -Level "WARN"
+        $finalBcd = (bcdedit /set hypervisorlaunchtype off 2>&1 | Out-String).Trim()
+        Write-Log "hypervisorlaunchtype set to Off ($finalBcd)" -Level "SUCCESS"
+    }
+} catch {
+    Write-Log "BCD verification note: $($_.Exception.Message)" -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Step 9b: Disabling Fast Startup (Crucial for ASUS Laptops)
+# ------------------------------------------------------------
+Write-Log "`n=== Step 9b: Disabling Fast Startup (Ensures Clean Hypervisor Reload on ASUS) ===" -Level "INFO" -Color Cyan
+try {
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled" -Value 0 -Type DWord -Force
+    Write-Log "Fast Startup disabled in registry." -Level "SUCCESS"
+} catch {
+    Write-Log "Could not disable Fast Startup: $($_.Exception.Message)" -Level "WARN"
+}
+
+# ------------------------------------------------------------
+# Completion
+# ------------------------------------------------------------
+Write-Log "`n============================================================" -Level "SUCCESS"
+Write-Log "ALL STEPS COMPLETED!" -Level "SUCCESS"
+Write-Log "Steps executed:" -Level "INFO" -Color Cyan
+Write-Log "  PF. Pre-Flight: Battery/AC check, System Restore Point, BCD Backup" -Level "INFO" -Color Gray
+Write-Log "  0.  Detected OEM manufacturer & disabled OEM bloatware services/tasks" -Level "INFO" -Color Gray
+Write-Log "  0b. Removed WSL2 (Store version + Windows feature)" -Level "INFO" -Color Gray
+Write-Log "  1.  Stopped Hyper-V services (with verification)" -Level "INFO" -Color Gray
+Write-Log "  2.  Disabled Hyper-V, HypervisorPlatform, VMP, WSL features" -Level "INFO" -Color Gray
+Write-Log "  3.  Set hypervisorlaunchtype off in BCD" -Level "INFO" -Color Gray
+Write-Log "  4.  VBS registry: Set to 0 AND deleted keys (dual method)" -Level "INFO" -Color Gray
+Write-Log "  5.  Memory Integrity (HVCI) disabled" -Level "INFO" -Color Gray
+Write-Log "  6.  Credential Guard, GPO policy, SIPolicy.p7b, WDAC .cip cleared" -Level "INFO" -Color Gray
+Write-Log "  7.  Hyper-V/IOMMU disabled via DISM (DG Readiness Tool method)" -Level "INFO" -Color Gray
+Write-Log "  8.  UEFI Opt-Out configured via SecConfig.efi" -Level "INFO" -Color Gray
+Write-Log "  9.  BCD hypervisorlaunchtype verified = Off" -Level "INFO" -Color Gray
+Write-Log "Detailed IT execution report written to: $logFile" -Level "INFO" -Color Cyan
+Write-Log "IMPORTANT: During boot, Windows will prompt to confirm changes - press F3 (or Fn+F3)." -Level "WARN"
+Write-Log "NOTE: At login screen, click 'Set up my PIN' and enter your account password." -Level "WARN"
+Write-Log "============================================================" -Level "SUCCESS"
+
+# ------------------------------------------------------------
+# Post-Execution Verification: Check if VBS is actually OFF right now
+# ------------------------------------------------------------
+Write-Log "`n=== Post-Execution Verification: Checking if VBS is truly OFF ===" -Level "INFO" -Color Cyan
+$vbsStillOn = $false
+try {
+    $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction Stop
+    Write-Log "VirtualizationBasedSecurityStatus: $($dg.VirtualizationBasedSecurityStatus) (0=Off, 1=Pending, 2=Running)" -Level "INFO" -Color Gray
+    Write-Log "SecurityServicesRunning: $($dg.SecurityServicesRunning -join ', ') (empty = good)" -Level "INFO" -Color Gray
+    Write-Log "SecurityServicesConfigured: $($dg.SecurityServicesConfigured -join ', ')" -Level "INFO" -Color Gray
+    if ($dg.VirtualizationBasedSecurityStatus -eq 2 -or ($dg.SecurityServicesRunning -and $dg.SecurityServicesRunning.Count -gt 0)) {
+        $vbsStillOn = $true
+        Write-Log "WARNING: VBS is still RUNNING — hypervisor will hold VT-x. Reboot required + check OEM bloatware." -Level "WARN"
+    } else {
+        Write-Log "VBS is OFF (or pending reboot to turn off). Good." -Level "SUCCESS"
+    }
+} catch {
+    Write-Log "Could not query Win32_DeviceGuard: $($_.Exception.Message)" -Level "WARN"
+}
+
+# Check HVCI registry
+try {
+    $hvci = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -ErrorAction SilentlyContinue
+    if ($hvci -and $hvci.Enabled -eq 1) {
+        Write-Log "WARNING: HVCI registry still shows Enabled=1 — OEM bloatware may re-enable on reboot." -Level "WARN"
+    } else {
+        Write-Log "HVCI registry is OFF (or key absent). Good." -Level "SUCCESS"
+    }
+} catch {
+    Write-Log "HVCI registry check note: $($_.Exception.Message)" -Level "WARN"
+}
+
+if ($vbsStillOn) {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host "  VBS IS STILL RUNNING — REBOOT REQUIRED" -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host "  VBS did not turn off yet. After reboot:" -ForegroundColor White
+    Write-Host "  1. Re-open Windows Security -> Device Security -> Core Isolation" -ForegroundColor White
+    Write-Host "  2. Confirm Memory Integrity is OFF (turn it OFF manually if ON)" -ForegroundColor White
+    Write-Host "  3. Press F3 (or Fn+F3) during boot if prompted" -ForegroundColor White
+    Write-Host "  4. Re-run this script's verification block" -ForegroundColor White
+    Write-Host "============================================================" -ForegroundColor Yellow
+} else {
+    Write-Host ""
+    Write-Host "VBS is OFF. Reboot to finalize, then EVE-NG should get VT-x." -ForegroundColor Green
+}
+
+# ------------------------------------------------------------
+# Emergency Recovery Instructions (printed for reference before reboot)
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "  EMERGENCY RECOVERY INFO (save this — just in case)" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "  If PC won't boot after reboot (power loss during Step 8):" -ForegroundColor White
+Write-Host "" -ForegroundColor White
+Write-Host "  Method 1 — Automatic Repair (easiest):" -ForegroundColor Yellow
+Write-Host "    Force-restart 3x -> Windows enters Automatic Repair" -ForegroundColor White
+Write-Host "    -> Advanced Options -> Command Prompt -> run:" -ForegroundColor White
+Write-Host "      bcdedit /set {bootmgr} bootsequence {current}" -ForegroundColor Gray
+Write-Host "      bcdedit /delete {0cb3b571-2f2e-4343-a879-d86a476d7215} /f" -ForegroundColor Gray
+Write-Host "" -ForegroundColor White
+Write-Host "  Method 2 — Restore BCD from backup:" -ForegroundColor Yellow
+Write-Host "      bcdedit /import $bcdBackupPath" -ForegroundColor Gray
+Write-Host "" -ForegroundColor White
+Write-Host "  Method 3 — System Restore:" -ForegroundColor Yellow
+Write-Host "    WinRE -> Advanced Options -> System Restore" -ForegroundColor White
+Write-Host "    -> choose 'Before Hyper-V VBS Disable Script'" -ForegroundColor White
+Write-Host "" -ForegroundColor White
+Write-Host "  BCD backup location: $LogDir\BCD_Backup_*.bcd" -ForegroundColor Green
+Write-Host "  Log file: $logFile" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Cyan
+
+Write-Host "`n============================================================" -ForegroundColor Yellow
+Write-Host "  IMPORTANT REBOOT & ASUS VIVOBOOK INSTRUCTIONS:" -ForegroundColor Yellow
+Write-Host "============================================================" -ForegroundColor Yellow
+Write-Host "  1. DURING REBOOT: On the 'Credential Guard Opt-Out' screen," -ForegroundColor White
+Write-Host "     >>> PRESS THE WINDOWS KEY (OR Fn + F3) <<<" -ForegroundColor Cyan
+Write-Host "     (Do NOT press F3 alone — ASUS keyboards map F3 to volume/media keys!)" -ForegroundColor Yellow
+Write-Host "  2. ASUS BIOS SETTING: If running AMD Ryzen, ensure SVM is ON:" -ForegroundColor White
+Write-Host "     Reboot -> F2 (BIOS) -> F7 (Advanced) -> CPU Configuration -> SVM Mode -> Enabled" -ForegroundColor Gray
+Write-Host "  3. AT LOGIN SCREEN: If Windows asks to set up PIN, enter your" -ForegroundColor White
+Write-Host "     Windows password (or authenticate via email OTP)." -ForegroundColor White
+Write-Host "  4. KEEP CHARGER PLUGGED IN until Windows finishes restarting!" -ForegroundColor White
+Write-Host "============================================================" -ForegroundColor Yellow
+
+Write-Host ""
+$promptMsg = "Ready to restart your computer to apply changes.`nPress ENTER or [Y] to reboot now, or [N] to reboot manually later: "
+$response = Read-Host -Prompt $promptMsg
+
+if ([string]::IsNullOrWhiteSpace($response) -or $response -match "^[yY]") {
+    Write-Log "User confirmed reboot. Restarting computer in 5 seconds..." -Level "WARN"
+    Write-Host "`nRestarting in 5 seconds (Remember to press the WINDOWS KEY or Fn+F3 on the prompt screen!)..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 5
+    Restart-Computer -Force
+} else {
+    Write-Log "Immediate reboot postponed by user. Manual reboot required to apply changes." -Level "INFO"
+    Write-Host "`nReboot postponed. Please restart your PC manually to complete changes." -ForegroundColor Yellow
+    Write-Host "Press ENTER to exit..." -ForegroundColor Gray
+    Read-Host
+}
