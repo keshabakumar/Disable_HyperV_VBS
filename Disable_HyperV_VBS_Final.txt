@@ -7,7 +7,9 @@
 # ============================================================
 
 param(
-    [string]$LogDir = "C:\DGLogs"
+    [string]$LogDir = "C:\DGLogs",
+    [switch]$SkipBitLockerPrompt,
+    [switch]$Force
 )
 
 # ------------------------------------------------------------
@@ -149,7 +151,8 @@ try {
             Write-Host "   [Y] Continue anyway" -ForegroundColor White
             Write-Host "   [N] Abort (plug in charger first)" -ForegroundColor White
             Write-Host "============================================================" -ForegroundColor Yellow
-            $chargerChoice = Read-Host " Do you want to continue? (y/N)"
+            $chargerChoice = Read-Host " Do you want to continue? [Y/n]"
+            if ([string]::IsNullOrWhiteSpace($chargerChoice)) { $chargerChoice = "Y" }
             if ($chargerChoice -notmatch "^[yY]") {
                 Write-Log "User chose to abort because charger is not connected." -Level "INFO"
                 Write-Host "`nScript aborted by user. Please connect your charger and re-run." -ForegroundColor Gray
@@ -207,13 +210,13 @@ try {
     Write-Log "Could not detect manufacturer: $($_.Exception.Message)" -Level "WARN"
 }
 
-# Universal OEM service list (covers ASUS, MSI, Razer, Lenovo, HP, Acer)
+# Universal OEM service list (covers ASUS, MSI, Razer, Lenovo, HP, Acer, Dell)
 $oemServices = @(
     "ArmouryCrateService*","MyASUS*","AsIO*","AsusAppService*","ASUSSoftwareManager*","ASUSSystemAnalysis*","ASUSOptimization*","AsusSysCap*","AsusLinkNear*",  # ASUS
     "MSICenterService*","MSI_App_Service*","MSI*Service*",                                          # MSI
     "RazerSynapseService*","RazerGameManagerService*","Razer*Service*",                             # Razer
     "LenovoVantage*","ImControllerService*","Lenovo*Service*",                                      # Lenovo
-    "HPSureClick*","HP*Service*","HPCommRecovery*",                                                  # HP
+    "HPSureClick*","HPCommRecovery*",                                                               # HP (targeted, avoids printer/scanner services)
     "AcerCareCenter*","PredatorSense*","Acer*Service*"                                              # Acer
 )
 $foundSvc = Get-Service -Name $oemServices -ErrorAction SilentlyContinue
@@ -221,7 +224,8 @@ if ($foundSvc) {
     foreach ($svc in $foundSvc) {
         try {
             Write-Log "Disabling OEM service: $($svc.Name) ($($svc.DisplayName))" -Level "WARN"
-            Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+            # Stop service with NoWait so slow services never block execution
+            Stop-Service -Name $svc.Name -Force -NoWait -ErrorAction SilentlyContinue
             Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
             Write-Log "Disabled OEM service: $($svc.Name)" -Level "SUCCESS"
         } catch {
@@ -260,11 +264,19 @@ if ($foundTasks) {
 # ------------------------------------------------------------
 Write-Log "`n=== Step 0b: Removing WSL2 (holds the hypervisor / VT-x) ===" -Level "INFO" -Color Cyan
 try {
-    $wslExe = Get-Command wsl -ErrorAction SilentlyContinue
+    $wslExe = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if ($wslExe) {
-        Write-Log "Shutting down any running WSL instances..." -Level "INFO"
-        wsl --shutdown 2>&1 | Out-Null
-        Write-Log "WSL instances shut down." -Level "SUCCESS"
+        Write-Log "Shutting down any running WSL instances (max 10s timeout)..." -Level "INFO"
+        $wslProc = Start-Process -FilePath "wsl.exe" -ArgumentList "--shutdown" -PassThru -NoNewWindow -ErrorAction SilentlyContinue
+        if ($wslProc) {
+            $finished = $wslProc.WaitForExit(10000)
+            if (-not $finished) {
+                Write-Log "WSL shutdown timed out after 10s — terminating process..." -Level "WARN"
+                Stop-Process -Id $wslProc.Id -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Log "WSL instances shut down successfully." -Level "SUCCESS"
+            }
+        }
     }
 } catch {
     Write-Log "WSL shutdown note: $($_.Exception.Message)" -Level "WARN"
@@ -331,28 +343,39 @@ if ($bitlockerActive) {
     Write-Host "============================================================" -ForegroundColor Yellow
     Write-Host "  WARNING: BITLOCKER / DEVICE ENCRYPTION IS ACTIVE" -ForegroundColor Yellow
     Write-Host "============================================================" -ForegroundColor Yellow
-    Write-Host ""
+    Write-Host "  Drive C: has encryption enabled (Status: Protection On)." -ForegroundColor Yellow
     Write-Host "  This script changes UEFI variables (SecConfig.efi) and BCD entries." -ForegroundColor Yellow
     Write-Host "  On the next reboot, Windows may require your 48-digit Recovery Key!" -ForegroundColor Yellow
     Write-Host "  Make sure you have your BitLocker Recovery Key saved before continuing." -ForegroundColor Cyan
     Write-Host "  (You can find it at: https://account.microsoft.com/devices/recoverykey)" -ForegroundColor Cyan
     Write-Host ""
+    Write-Host "  If you continue, the script will automatically SUSPEND BitLocker" -ForegroundColor Green
+    Write-Host "  protection for upcoming reboots so your PC boots normally." -ForegroundColor Green
+    Write-Host ""
     Write-Host "  Options:" -ForegroundColor White
-    Write-Host "    [Y] Continue anyway (will temporarily suspend BitLocker for next reboot)" -ForegroundColor White
-    Write-Host "    [N] Abort (recommended if you do not have your recovery key saved)" -ForegroundColor White
+    Write-Host "    [Y] Continue & automatically suspend BitLocker (Recommended)" -ForegroundColor White
+    Write-Host "    [N] Abort (save recovery key first)" -ForegroundColor White
     Write-Host "============================================================" -ForegroundColor Yellow
     Write-Host ""
-    $blChoice = Read-Host "Do you want to continue anyway? (y/N)"
+    
+    $blChoice = "Y"
+    if (-not $SkipBitLockerPrompt -and -not $Force) {
+        $blChoice = Read-Host "Type Y to suspend BitLocker and continue, or N to abort [Y/n]"
+        if ([string]::IsNullOrWhiteSpace($blChoice)) {
+            $blChoice = "Y"
+        }
+    }
+    
     if ($blChoice -notmatch "^[yY]") {
         Write-Log "User chose to abort due to active BitLocker." -Level "INFO"
         Write-Host "`nScript aborted by user. No changes were made." -ForegroundColor Gray
         exit
     }
 
-    Write-Log "User chose to proceed with BitLocker active. Temporarily suspending BitLocker protection..." -Level "WARN"
+    Write-Log "User chose to proceed with BitLocker active. Temporarily suspending BitLocker protection for 2 reboots..." -Level "WARN"
     try {
         Suspend-BitLocker -MountPoint "C:" -RebootCount 2 -ErrorAction SilentlyContinue | Out-Null
-        manage-bde -protectors -disable C: 2>&1 | Out-Null
+        manage-bde -protectors -disable C: -RebootCount 2 2>&1 | Out-Null
         Write-Log "BitLocker suspended for upcoming reboots to prevent recovery key lock." -Level "SUCCESS"
         Write-Host "BitLocker temporarily suspended for upcoming reboots." -ForegroundColor Green
     } catch {
@@ -553,12 +576,13 @@ if (Test-Path -Path $secConfigSrc) {
     $efiMounted = $false
     try {
         # Pick the first available drive letter from Z: down to E: to avoid collisions
-        $availableLetters = 90..69 | ForEach-Object { [char]$_ + ":" } | Where-Object { -not (Test-Path -Path $_) }
-        if (-not $availableLetters) {
+        $usedLetters = [System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpper() }
+        $avail = 90..69 | ForEach-Object { [char]$_ } | Where-Object { $_ -notin $usedLetters } | Select-Object -First 1
+        if (-not $avail) {
             Write-Log "No available drive letter found to mount EFI partition." -Level "ERROR"
             throw "No free drive letter available."
         }
-        $freeDrive = $availableLetters[0]
+        $freeDrive = "$($avail):"
 
         Write-Log "Mounting EFI System Partition to temporary drive $freeDrive..." -Level "INFO"
         mountvol $freeDrive /s
